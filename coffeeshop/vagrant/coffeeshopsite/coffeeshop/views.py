@@ -128,63 +128,47 @@ def orders(request):
 
 
 @login_required
-@require_http_methods(["POST"])
+@require_http_methods(["GET", "POST"])
 def addtocart(request):
     log = logging.getLogger('django')
     error_msg = ""
     product_id = None
     product = None
     cart_size = 0
-    if ('id' not in request.POST):
+
+    # Accept parameters from POST (normal) or GET (after login redirect)
+    data = request.POST if request.method == "POST" else request.GET
+
+    if 'id' not in data:
         error_msg = "Product not found"
     else:
         try:
-            product_id = int(request.POST['id'])
+            product_id = int(data.get('id'))
             product = Product.objects.get(id=product_id)
         except Exception as e:
             log.error(e)
             error_msg = "Product not found"
+
     quantity = 1
-    if ('qty' in request.POST):
+    if 'qty' in data:
         try:
-            quantity = int(request.POST['qty'])
-            if (quantity < 1):
+            quantity = int(data.get('qty'))
+            if quantity < 1:
                 error_msg = "Invalid quantity"
         except Exception as e:
             log.error(e)
             error_msg = "Invalid quantity"
-    if (error_msg == ""):
-        try:
-            cart = None
-            if (request.user.cart_set.count() > 0):
-                cart = request.user.cart_set.first()
-                cart_size = cart.cartitem_set.count()
-            else:
-                cart = Cart(user_id=request.user.id)
-                cart.save()
-            cart_item = None
-            for item in cart.cartitem_set.all():
-                if (item.product_id == product_id):
-                    cart_item = item
-                    break
-            cart_size = cart.cartitem_set.count()
-            if (cart_item is None):
-                cart_item = CartItem(product_id=product_id, cart_id=cart.id,
-                                     quantity=quantity)
-                cart_size += 1
-            else:
-                cart_item.quantity += quantity
-            cart_item.save()
-        except Exception as e:
-            log.error(e)
-            error_msg = "Can't add item to cart"
 
-    if (error_msg == ""):
-        context = {"cart_size": cart_size}
-        return render(request, 'coffeeshop/itemadded.html', context)
-    else:
-        context = {"cart_size": cart_size, 'error_msg': error_msg}
-        return render(request, 'coffeeshop/error.html', context)
+    if error_msg == "":
+        cart, created = Cart.objects.get_or_create(user=request.user)
+        cart_item, created = CartItem.objects.get_or_create(cart=cart, product=product)
+        cart_item.quantity += quantity
+        cart_item.save()
+        cart_size = cart.items.count()
+
+    context = {"cart_size": cart_size, "error_msg": error_msg}
+    return render(request, 'coffeeshop/itemadded.html', context)
+
 
 
 @login_required

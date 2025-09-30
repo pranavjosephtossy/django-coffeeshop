@@ -1,93 +1,115 @@
 #!/usr/bin/env bash
+set -euo pipefail
 
-export DEBIAN_FRONTEND=noninteractive
+# ---- systemctl shim for Docker ----
+if ! command -v systemctl >/dev/null 2>&1; then
+  systemctl() {
+    case "$*" in
+      *"restart apache2"*)    apachectl -k restart || true ;;
+      *"reload apache2"*)     apachectl -k graceful || true ;;
+      *"start apache2"*)      apachectl -k start || true ;;
+      *"restart postgresql"*) pg_lsclusters | awk 'NR>1{print $1,$2}' | while read -r v n; do pg_ctlcluster "$v" "$n" restart || true; done ;;
+      *"start postgresql"*)   pg_lsclusters | awk 'NR>1{print $1,$2}' | while read -r v n; do pg_ctlcluster "$v" "$n" start || true; done ;;
+      *"restart mailcatcher"*) pkill -f mailcatcher || true; mailcatcher --smtp-ip 0.0.0.0 --http-ip 0.0.0.0 || true ;;
+      *"start mailcatcher"*)  mailcatcher --smtp-ip 0.0.0.0 --http-ip 0.0.0.0 || true ;;
+      *) true ;;
+    esac
+  }
+fi
 
-. /secrets/config.env
+APP_DIR="/vagrant/coffeeshopsite"
+SECRETS_DIR="/secrets"
+cd "$APP_DIR"
 
-echo ". /secrets/config.env" >> /home/vagrant/.bashrc
+echo "Ensuring scripts are executable…"
+chmod +x "$APP_DIR"/*.sh 2>/dev/null || true
 
-# Install packages
-apt-get update -y
-apt-get install -y apache2 
-apt-get install -y python3-pip python3.8-venv
-apt-get install -y libapache2-mod-wsgi-py3
-apt-get install -y postgresql postgresql-contrib 
-apt-get install -y ssh telnet lsof
-apt-get install -y python3-testresources
-apt install -y net-tools iputils-ifconfig git
-apt install -y nmap ufw
-apt install -y pwgen
-apt install -y libpq-dev
+# ---- Secrets / env ----
+if [ -f "$SECRETS_DIR/config.env" ]; then
+  # shellcheck disable=SC1091
+  source "$SECRETS_DIR/config.env"
+else
+  echo "Creating $SECRETS_DIR/config.env with lab defaults…"
+  mkdir -p "$SECRETS_DIR"
+  : "${DBOWNER:=dbuser}"
+  : "${DBOWNERPWD:=dbpass}"
+  : "${DBNAME:=coffeeshop}"
+  : "${SECRET_KEY:=}"
+  if [ -z "$SECRET_KEY" ]; then
+    SECRET_KEY="$(python3 - <<'PY'
+import secrets; print(secrets.token_urlsafe(50))
+PY
+)"
+  fi
+  cat > "$SECRETS_DIR/config.env" <<EOF
+SECRET_KEY=$SECRET_KEY
+DBOWNER=$DBOWNER
+DBOWNERPWD=$DBOWNERPWD
+DBNAME=$DBNAME
+EOF
+fi
+# If settings.py calls: from dotenv import load_dotenv; load_dotenv('/secrets/config.env')
+# …then manage.py sees these automatically.
 
-# Fix for a problem with pyOpenSSL
-cd /tmp
-apt remove -y python3-pip 
-wget https://bootstrap.pypa.io/get-pip.py
-python3 get-pip.py
-hash -r
+# ---- Optional: install project requirements ----
+if [ -f "$APP_DIR/requirements.txt" ]; then
+  echo "Installing Python requirements.txt…"
+  pip3 install --no-cache-dir -r "$APP_DIR/requirements.txt" || true
+fi
 
-# Install mailcatcher
-# Mailcatcher is an implementation of SMTP that stores email locally rather than
-# forwarding it.  You can view and delete the emails via a web local interface.
-apt install -y build-essential libsqlite3-dev ruby-dev
-gem install mailcatcher --no-document 
-cp /vagrant/mailcatcher/mailcatcher.service /etc/systemd/system/mailcatcher.service
-chmod 755 /etc/systemd/system/mailcatcher.service
-systemctl enable mailcatcher
-service mailcatcher start
+# ---- Start PostgreSQL cluster if needed ----
+echo "Starting PostgreSQL if needed…"
+if command -v pg_lsclusters >/dev/null 2>&1; then
+  pg_lsclusters | awk 'NR>1{print $1,$2,$4}' | while read -r ver name state; do
+    [ "$state" = "online" ] || pg_ctlcluster "$ver" "$name" start || true
+  done
+fi
 
-# Simple mail sending client.  Django has a much better and safer one, but we will use
-# this to demonstrate command injection
-apt-get install -y ssmtp
-cp /vagrant/ssmtp/ssmtp.conf /etc/ssmtp/ssmtp.conf
+# Ensure DB role exists
+if ! sudo -u postgres psql -tAc "SELECT 1 FROM pg_roles WHERE rolname='${DBOWNER}'" | grep -q 1; then
+  sudo -u postgres psql -c "CREATE ROLE ${DBOWNER} LOGIN PASSWORD '${DBOWNERPWD}';" || true
+fi
 
-# Install python packages
-pip3 install -r /vagrant/coffeeshopsite/requirements.txt
-pip3 install slowloris
+# ---- Rebuild DB & seed data (idempotent) ----
+bash "$APP_DIR/rebuild_database.sh"
 
-# set hostname
-hostnamectl set-hostname coffeeshop
+# ---- Apache: link project path & create vhost ----
+# Use a stable path Apache can read; keep /vagrant as the source of truth
+[ -d /var/www/coffeeshopsite ] || ln -s "$APP_DIR" /var/www/coffeeshopsite
 
-# Install coffeeshop web app
-ln -fs /vagrant/coffeeshopsite /var/www/
+if [ ! -f /etc/apache2/sites-available/coffeeshop.conf ]; then
+  cat >/etc/apache2/sites-available/coffeeshop.conf <<'CONF'
+<VirtualHost *:80>
+    ServerName localhost
 
-# Install apache config
-rm /etc/apache2/apache2.conf
-rm /etc/apache2/envvars
-cp /vagrant/apache2/apache2.conf /etc/apache2/
-cp /vagrant/apache2/envvars /etc/apache2/
-a2enmod ssl
+    # Django via mod_wsgi
+    WSGIDaemonProcess coffeeshop python-path=/var/www/coffeeshopsite
+    WSGIProcessGroup  coffeeshop
+    WSGIScriptAlias / /var/www/coffeeshopsite/coffeeshopsite/wsgi.py
 
-# Set up Postgres
-pgvers=12
-mv /etc/postgresql/${pgvers}/main/postgresql.conf /etc/postgresql/${pgvers}/main/postgresql.conf.orig 
-mv /etc/postgresql/${pgvers}/main/pg_hba.conf /etc/postgresql/${pgvers}/main/pg_hba.conf.orig
-cp /vagrant/postgres/postgresql.conf /etc/postgresql/${pgvers}/main/postgresql.conf
-cp /vagrant/postgres/pg_hba.conf /etc/postgresql/${pgvers}/main/pg_hba.conf
-chown postgres.postgres /etc/postgresql/${pgvers}/main/postgresql.conf /etc/postgresql/${pgvers}/main/pg_hba.conf
-chown postgres.postgres /etc/postgresql/${pgvers}/main/pg_hba.conf
-chmod 640 /etc/postgresql/${pgvers}/main/pg_hba.conf
-service postgresql restart
+    # Static files
+    Alias /static/ /var/www/coffeeshopsite/coffeeshop/static/
+    <Directory /var/www/coffeeshopsite/coffeeshop/static>
+        Require all granted
+    </Directory>
 
-# Install web site
-a2dissite 000-default.conf
-cp /vagrant/apache2/000-default.conf /etc/apache2/sites-available/000-default.conf
-a2ensite 000-default.conf
-a2enmod rewrite
-apachectl restart
+    <Directory /var/www/coffeeshopsite/coffeeshopsite>
+        <Files wsgi.py>
+            Require all granted
+        </Files>
+    </Directory>
 
-# Set up database
-cd /vagrant/coffeeshopsite
-sudo -u postgres psql -c "CREATE DATABASE coffeeshop"
-sudo -u postgres psql -c "CREATE USER $DBOWNER WITH PASSWORD '$DBOWNERPWD';"
-sudo -u postgres psql -c "ALTER ROLE $DBOWNER SET client_encoding TO 'utf8'; ALTER ROLE $DBOWNER SET timezone TO 'UTC';"
-sudo -u postgres psql -c "ALTER DATABASE coffeeshop OWNER TO $DBOWNER;"
-python3 manage.py migrate
-sudo -u vagrant bash "/var/www/coffeeshopsite/create_users.sh"
-sudo -u vagrant bash "/var/www/coffeeshopsite/loaddata.sh"
-sudo -u vagrant bash "/var/www/coffeeshopsite/collectstatic.sh"
-systemctl restart apache2
+    ErrorLog  ${APACHE_LOG_DIR}/coffeeshop_error.log
+    CustomLog ${APACHE_LOG_DIR}/coffeeshop_access.log combined
+</VirtualHost>
+CONF
+fi
 
-# Create other users
-adduser --disabled-password --gecos "" dbuser
-usermod -a -G www-data vagrant
+a2enmod wsgi rewrite >/dev/null 2>&1 || true
+a2ensite coffeeshop >/dev/null 2>&1 || true
+a2dissite 000-default >/dev/null 2>&1 || true
+systemctl reload apache2
+
+echo "✅ Provisioning complete:"
+echo "   App:        http://localhost:8080"
+echo "   Mailcatcher: http://localhost:1080"
